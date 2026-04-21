@@ -104,6 +104,15 @@ export default function ChartPanel() {
 
   const currentInterval = chartInterval || scanInterval;
 
+  // When selectedPair changes (from Screener), update chart inputs and switch to pair mode
+  React.useEffect(() => {
+    if (selectedPair) {
+      setPairSymbol1(selectedPair.symbol1);
+      setPairSymbol2(selectedPair.symbol2);
+      setChartMode("pair");
+    }
+  }, [selectedPair]);
+
   // Fetch pair chart data
   const { data: pairData, isLoading: pairLoading } = useQuery<PairChartData>({
     queryKey: ["pairChart", pairSymbol1, pairSymbol2, currentInterval],

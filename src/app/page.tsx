@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useCallback } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import ScreenerPanel from "@/components/screener/ScreenerPanel";
 import SyntheticsPanel from "@/components/synthetics/SyntheticsPanel";
@@ -53,6 +53,10 @@ function AppContent() {
     checkConnection();
     const interval = setInterval(checkConnection, 60000);
     return () => clearInterval(interval);
+  }, []);
+
+  const handleSwitchTab = useCallback((tab: TabId) => {
+    setActiveTab(tab);
   }, []);
 
   return (
@@ -148,7 +152,9 @@ function AppContent() {
 
         {/* Main content */}
         <main className="flex-1 min-w-0 p-4 overflow-auto">
-          {activeTab === "screener" && <ScreenerPanel />}
+          {activeTab === "screener" && (
+            <ScreenerPanel onSwitchTab={handleSwitchTab} />
+          )}
           {activeTab === "synthetics" && <SyntheticsPanel />}
           {activeTab === "chart" && <ChartPanel />}
         </main>

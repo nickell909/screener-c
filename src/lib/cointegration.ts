@@ -81,7 +81,16 @@ function stdDev(arr: number[]): number {
   return Math.sqrt(variance(arr));
 }
 
-// Augmented Dickey-Fuller test for stationarity
+/**
+ * Augmented Dickey-Fuller test for stationarity.
+ *
+ * Uses the Frisch-Waugh-Lovell (FWL) theorem for numerical stability:
+ * 1. Regress Δy(t) on lagged differences → get residual Δỹ(t)
+ * 2. Regress y(t-1) on lagged differences → get residual ỹ(t-1)
+ * 3. Regress Δỹ(t) on ỹ(t-1) → the t-stat of the slope is the ADF statistic
+ *
+ * This avoids full matrix inversion and is much more robust.
+ */
 export function adfTest(series: number[], maxLags?: number): ADFResult {
   const n = series.length;
   const criticalValues = {
@@ -90,7 +99,7 @@ export function adfTest(series: number[], maxLags?: number): ADFResult {
     10: -2.57,
   };
 
-  if (n < 20) {
+  if (n < 25) {
     return {
       statistic: 0,
       pValue: 1.0,
@@ -99,71 +108,89 @@ export function adfTest(series: number[], maxLags?: number): ADFResult {
     };
   }
 
-  // Determine the number of lags
-  const lags = maxLags ?? Math.min(Math.floor(12 * Math.pow(n / 100, 1 / 4)), n - 3);
-
-  if (lags >= n - 2) {
-    return {
-      statistic: 0,
-      pValue: 1.0,
-      isStationary: false,
-      criticalValues,
-    };
-  }
-
-  // Calculate first differences
+  // Calculate first differences: Δy(t) = y(t) - y(t-1)
   const dy: number[] = [];
   for (let i = 1; i < n; i++) {
     dy.push(series[i] - series[i - 1]);
   }
 
-  // Lagged level (y(t-1))
+  // Lagged level: y(t-1)
   const yLagged: number[] = series.slice(0, n - 1);
 
-  // Lagged differences
-  const laggedDiffs: number[][] = [];
-  for (let lag = 1; lag <= lags; lag++) {
-    const diffLag: number[] = [];
-    for (let i = lag; i < dy.length; i++) {
-      diffLag.push(dy[i - lag]);
-    }
-    laggedDiffs.push(diffLag);
-  }
+  // Determine max lag length (Schwert criterion, capped at 8 for stability)
+  const maxL = maxLags ?? Math.min(Math.floor(Math.sqrt(n)), 8);
 
-  // Align all arrays - the effective length after accounting for lags
-  const effectiveLen = dy.length - lags;
-  if (effectiveLen < 10) {
-    return {
-      statistic: 0,
-      pValue: 1.0,
-      isStationary: false,
-      criticalValues,
-    };
-  }
+  // Try ADF with decreasing lags until we find one that works
+  for (let lags = maxL; lags >= 0; lags--) {
+    const effectiveLen = dy.length - lags;
+    if (effectiveLen < 15) continue;
 
-  // Dependent variable: dy from index lags to end
-  const depVar = dy.slice(lags);
+    // Dependent variable: Δy(t) for t from (lags+1) to end
+    const depVar = dy.slice(lags);
 
-  // Independent variables: yLagged from index lags to end, plus lagged differences
-  // Build the regression: dy(t) = alpha * y(t-1) + sum(beta_i * dy(t-i)) + error
-
-  // For simplicity with OLS, we'll do a simple regression of dy on yLagged
-  // with lagged differences as additional regressors
-
-  if (lags === 0) {
-    // Simple DF test: dy(t) = alpha * y(t-1) + error
+    // Independent variable: y(t-1) for t from (lags+1) to end
     const yIndep = yLagged.slice(lags);
-    const result = olsRegression(depVar, yIndep);
 
-    // Calculate the standard error of the slope coefficient
-    const residuals = result.residuals;
-    const residualVariance = residuals.reduce((s, r) => s + r * r, 0) / (effectiveLen - 2);
-    const yIndepVariance = yIndep.reduce((s, v) => s + (v - mean(yIndep)) ** 2, 0);
-    const seSlope = Math.sqrt(residualVariance / (yIndepVariance || 1));
+    if (lags === 0) {
+      // Simple DF test: Δy(t) = α * y(t-1) + error
+      const result = olsRegression(depVar, yIndep);
+      const residuals = result.residuals;
+      const residualVariance = residuals.reduce((s, r) => s + r * r, 0) / (effectiveLen - 2);
+      const yIndepVariance = yIndep.reduce((s, v) => s + (v - mean(yIndep)) ** 2, 0);
 
-    const tStatistic = seSlope > 0 ? result.slope / seSlope : 0;
+      if (yIndepVariance < 1e-12) continue;
 
-    // Approximate p-value using interpolation
+      const seSlope = Math.sqrt(residualVariance / yIndepVariance);
+      if (seSlope < 1e-12) continue;
+
+      const tStatistic = result.slope / seSlope;
+      const pValue = approximateADFPValue(tStatistic);
+
+      return {
+        statistic: tStatistic,
+        pValue,
+        isStationary: tStatistic < criticalValues[5],
+        criticalValues,
+      };
+    }
+
+    // ADF with lags using Frisch-Waugh-Lovell theorem
+    // Build lagged differences: Δy(t-j) for j=1..lags
+    // CRITICAL: must start from i = lags so that laggedDiffs[j][i] aligns with depVar[i]
+    const laggedDiffs: number[][] = [];
+    for (let lag = 1; lag <= lags; lag++) {
+      const diffLag: number[] = [];
+      for (let i = lags; i < dy.length; i++) {
+        diffLag.push(dy[i - lag]);
+      }
+      laggedDiffs.push(diffLag);
+    }
+
+    // Step 1 (FWL): Regress Δy(t) on lagged differences, get residuals
+    const dyResiduals = partialOut(laggedDiffs, depVar);
+
+    // Step 2 (FWL): Regress y(t-1) on lagged differences, get residuals
+    const yResiduals = partialOut(laggedDiffs, yIndep);
+
+    if (!dyResiduals || !yResiduals) continue;
+
+    // Step 3 (FWL): Regress dyResiduals on yResiduals
+    const finalResult = olsRegression(dyResiduals, yResiduals);
+    const finalResiduals = finalResult.residuals;
+
+    // The effective degrees of freedom: effectiveLen - (lags + 1) for the lagged diffs and intercept
+    const df = effectiveLen - lags - 1;
+    if (df < 5) continue;
+
+    const residualVariance = finalResiduals.reduce((s, r) => s + r * r, 0) / (df - 1);
+    const yResVariance = yResiduals.reduce((s, v) => s + (v - mean(yResiduals)) ** 2, 0);
+
+    if (yResVariance < 1e-12) continue;
+
+    const seSlope = Math.sqrt(residualVariance / yResVariance);
+    if (seSlope < 1e-12) continue;
+
+    const tStatistic = finalResult.slope / seSlope;
     const pValue = approximateADFPValue(tStatistic);
 
     return {
@@ -174,68 +201,91 @@ export function adfTest(series: number[], maxLags?: number): ADFResult {
     };
   }
 
-  // ADF with lags: use multiple regression approach
-  // dy(t) = alpha * y(t-1) + sum(beta_i * dy(t-i)) + error
-  // We'll use an iterative approach: first regress out the lagged differences, then test
+  // Ultimate fallback: simple DF test
+  const result = olsRegression(dy, yLagged);
+  const residuals = result.residuals;
+  const residualVariance = residuals.reduce((s, r) => s + r * r, 0) / (dy.length - 2);
+  const yLagVariance = yLagged.reduce((s, v) => s + (v - mean(yLagged)) ** 2, 0);
 
-  // Build the X matrix columns (as arrays)
-  const yIndep = yLagged.slice(lags);
-
-  // Multiple OLS regression using normal equations
-  // Variables: [1, y(t-1), dy(t-1), dy(t-2), ..., dy(t-lags)]
-  const numVars = 2 + lags; // intercept + y(t-1) + lagged diffs
-
-  // Build design matrix
-  const X: number[][] = [];
-  for (let i = 0; i < effectiveLen; i++) {
-    const row: number[] = [1, yIndep[i]];
-    for (let lag = 0; lag < lags; lag++) {
-      row.push(laggedDiffs[lag][i]);
-    }
-    X.push(row);
+  if (yLagVariance < 1e-12) {
+    return { statistic: 0, pValue: 1.0, isStationary: false, criticalValues };
   }
 
-  // Solve using normal equations: beta = (X'X)^-1 X'y
-  const beta = solveLinearRegression(X, depVar);
-
-  // Calculate residuals
-  const residuals: number[] = [];
-  for (let i = 0; i < effectiveLen; i++) {
-    let predicted = 0;
-    for (let j = 0; j < numVars; j++) {
-      predicted += beta[j] * X[i][j];
-    }
-    residuals.push(depVar[i] - predicted);
-  }
-
-  // Calculate standard error of the coefficient on y(t-1) (index 1)
-  const residualSS = residuals.reduce((s, r) => s + r * r, 0);
-  const residualVariance = residualSS / (effectiveLen - numVars);
-
-  // Calculate (X'X)^-1
-  const XtX = multiplyMatrices(transpose(X), X);
-  const XtXInv = invertMatrix(XtX);
-
-  if (XtXInv === null) {
-    return {
-      statistic: 0,
-      pValue: 1.0,
-      isStationary: false,
-      criticalValues,
-    };
-  }
-
-  const seAlpha = Math.sqrt(Math.abs(residualVariance * XtXInv[1][1]));
-
-  const tStatistic = seAlpha > 0 ? beta[1] / seAlpha : 0;
-  const pValue = approximateADFPValue(tStatistic);
+  const seSlope = Math.sqrt(residualVariance / yLagVariance);
+  const tStatistic = seSlope > 0 ? result.slope / seSlope : 0;
 
   return {
     statistic: tStatistic,
-    pValue,
+    pValue: approximateADFPValue(tStatistic),
     isStationary: tStatistic < criticalValues[5],
     criticalValues,
   };
+}
+
+/**
+ * Frisch-Waugh-Lovell partial out: regress y on X and return residuals.
+ * Uses sequential Gram-Schmidt orthogonalization (no matrix inversion needed).
+ *
+ * @param X - Array of regressor arrays (each inner array is one regressor)
+ * @param y - Dependent variable array
+ * @returns Residuals of y after removing the effect of X, or null if failed
+ */
+function partialOut(X: number[][], y: number[]): number[] | null {
+  if (X.length === 0) return [...y];
+
+  const n = y.length;
+  if (n < X.length + 2) return null;
+
+  // Start with y as the residual
+  let residual = [...y];
+
+  // Sequentially project out each regressor (Gram-Schmidt)
+  // First, also orthogonalize the regressors among themselves
+  const orthogonalX: number[][] = [];
+  const norms: number[] = [];
+
+  for (let k = 0; k < X.length; k++) {
+    let xk = [...X[k]];
+
+    // Remove projections onto previously orthogonalized regressors
+    for (let j = 0; j < orthogonalX.length; j++) {
+      const dot = dotProduct(xk, orthogonalX[j]);
+      const norm2 = norms[j] * norms[j];
+      if (norm2 < 1e-15) return null;
+
+      for (let i = 0; i < n; i++) {
+        xk[i] -= (dot / norm2) * orthogonalX[j][i];
+      }
+    }
+
+    const norm = Math.sqrt(dotProduct(xk, xk));
+    if (norm < 1e-10) {
+      // This regressor is linearly dependent on previous ones, skip it
+      continue;
+    }
+
+    orthogonalX.push(xk);
+    norms.push(norm);
+
+    // Remove the projection of residual onto this orthogonal regressor
+    const dotRes = dotProduct(residual, xk);
+    const norm2 = norm * norm;
+
+    for (let i = 0; i < n; i++) {
+      residual[i] -= (dotRes / norm2) * xk[i];
+    }
+  }
+
+  return residual;
+}
+
+function dotProduct(a: number[], b: number[]): number {
+  let sum = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    sum += a[i] * b[i];
+  }
+  return sum;
 }
 
 // Approximate p-value for ADF test statistic
@@ -244,9 +294,11 @@ function approximateADFPValue(testStat: number): number {
   // Approximate p-value using a lookup table approach
   // These are approximate points for the ADF distribution (no trend, with constant)
   const table: [number, number][] = [
-    [-4.0, 0.0001],
-    [-3.8, 0.0003],
-    [-3.6, 0.0007],
+    [-5.0, 0.00001],
+    [-4.5, 0.00005],
+    [-4.0, 0.0003],
+    [-3.8, 0.0007],
+    [-3.6, 0.0015],
     [-3.43, 0.01],
     [-3.3, 0.018],
     [-3.15, 0.03],
@@ -471,134 +523,4 @@ export function calculateSpread(
   }
 
   return spread;
-}
-
-// --- Matrix utility functions for multiple regression ---
-
-function transpose(matrix: number[][]): number[][] {
-  if (matrix.length === 0) return [];
-  const rows = matrix.length;
-  const cols = matrix[0].length;
-  const result: number[][] = [];
-  for (let j = 0; j < cols; j++) {
-    result[j] = [];
-    for (let i = 0; i < rows; i++) {
-      result[j][i] = matrix[i][j];
-    }
-  }
-  return result;
-}
-
-function multiplyMatrices(a: number[][], b: number[][]): number[][] {
-  const aRows = a.length;
-  const aCols = a[0]?.length ?? 0;
-  const bRows = b.length;
-  const bCols = b[0]?.length ?? 0;
-
-  if (aCols !== bRows) return [];
-
-  const result: number[][] = [];
-  for (let i = 0; i < aRows; i++) {
-    result[i] = [];
-    for (let j = 0; j < bCols; j++) {
-      let sum = 0;
-      for (let k = 0; k < aCols; k++) {
-        sum += a[i][k] * b[k][j];
-      }
-      result[i][j] = sum;
-    }
-  }
-  return result;
-}
-
-// Invert a matrix using Gauss-Jordan elimination
-function invertMatrix(matrix: number[][]): number[][] | null {
-  const n = matrix.length;
-  if (n === 0) return null;
-
-  // Create augmented matrix [A | I]
-  const aug: number[][] = [];
-  for (let i = 0; i < n; i++) {
-    aug[i] = [...matrix[i]];
-    for (let j = 0; j < n; j++) {
-      aug[i].push(i === j ? 1 : 0);
-    }
-  }
-
-  // Forward elimination with partial pivoting
-  for (let col = 0; col < n; col++) {
-    // Find pivot
-    let maxRow = col;
-    let maxVal = Math.abs(aug[col][col]);
-    for (let row = col + 1; row < n; row++) {
-      if (Math.abs(aug[row][col]) > maxVal) {
-        maxVal = Math.abs(aug[row][col]);
-        maxRow = row;
-      }
-    }
-
-    if (maxVal < 1e-12) return null; // Singular matrix
-
-    // Swap rows
-    [aug[col], aug[maxRow]] = [aug[maxRow], aug[col]];
-
-    // Scale pivot row
-    const pivotVal = aug[col][col];
-    for (let j = 0; j < 2 * n; j++) {
-      aug[col][j] /= pivotVal;
-    }
-
-    // Eliminate column
-    for (let row = 0; row < n; row++) {
-      if (row === col) continue;
-      const factor = aug[row][col];
-      for (let j = 0; j < 2 * n; j++) {
-        aug[row][j] -= factor * aug[col][j];
-      }
-    }
-  }
-
-  // Extract inverse
-  const inverse: number[][] = [];
-  for (let i = 0; i < n; i++) {
-    inverse[i] = aug[i].slice(n);
-  }
-
-  return inverse;
-}
-
-// Solve linear regression using normal equations: beta = (X'X)^-1 X'y
-function solveLinearRegression(X: number[][], y: number[]): number[] {
-  const n = X.length;
-  if (n === 0) return [];
-  const p = X[0].length;
-
-  const XtX = multiplyMatrices(transpose(X), X);
-  const XtY: number[] = [];
-  const Xt = transpose(X);
-
-  for (let j = 0; j < p; j++) {
-    let sum = 0;
-    for (let i = 0; i < n; i++) {
-      sum += Xt[j][i] * y[i];
-    }
-    XtY.push(sum);
-  }
-
-  const XtXInv = invertMatrix(XtX);
-  if (XtXInv === null) {
-    // Fallback: return zeros
-    return new Array(p).fill(0);
-  }
-
-  const beta: number[] = [];
-  for (let i = 0; i < p; i++) {
-    let sum = 0;
-    for (let j = 0; j < p; j++) {
-      sum += XtXInv[i][j] * XtY[j];
-    }
-    beta.push(sum);
-  }
-
-  return beta;
 }

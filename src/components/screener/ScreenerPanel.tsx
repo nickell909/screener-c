@@ -33,6 +33,8 @@ import {
   Plus,
   BarChart3,
   X,
+  ArrowRight,
+  Info,
 } from "lucide-react";
 import {
   LineChart,
@@ -54,7 +56,11 @@ interface Instrument {
   volume24h: number;
 }
 
-export default function ScreenerPanel() {
+interface ScreenerPanelProps {
+  onSwitchTab?: (tab: "screener" | "synthetics" | "chart") => void;
+}
+
+export default function ScreenerPanel({ onSwitchTab }: ScreenerPanelProps) {
   const {
     selectedSymbols,
     toggleSymbol,
@@ -77,6 +83,13 @@ export default function ScreenerPanel() {
 
   const [searchQuery, setSearchQuery] = useState("");
   const [showInstrumentSelector, setShowInstrumentSelector] = useState(false);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Show toast notification
+  const showToast = useCallback((msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3000);
+  }, []);
 
   // Fetch instruments
   const { data: instrumentsData } = useQuery({
@@ -153,21 +166,67 @@ export default function ScreenerPanel() {
     scanMutation.mutate();
   }, [selectedSymbols, scanMutation]);
 
+  /**
+   * Create synthetic from a cointegration result.
+   *
+   * The Engle-Granger test regresses: Y = hedgeRatio * X + intercept + residual
+   * The spread is: spread = Y - hedgeRatio * X - intercept
+   *
+   * So for a "long spread" position:
+   *   - Long Y (symbol1) with coefficient 1.0
+   *   - Short X (symbol2) with coefficient = hedgeRatio (if hedgeRatio > 0)
+   *
+   * If hedgeRatio < 0 (negative relationship, rare), both are long with adjusted coefficients.
+   */
   const handleCreateSynthetic = useCallback(
     (result: CointegrationResult) => {
       clearLegs();
+
+      // Symbol1 (Y in the regression) is always long with coefficient 1.0
       addLeg({
         symbol: result.symbol1,
         coefficient: 1.0,
         side: "long",
       });
-      addLeg({
-        symbol: result.symbol2,
-        coefficient: Math.abs(result.hedgeRatio),
-        side: result.hedgeRatio >= 0 ? "short" : "long",
-      });
+
+      // Symbol2 (X in the regression):
+      // If hedgeRatio > 0: short with coefficient = hedgeRatio
+      // If hedgeRatio < 0: long with coefficient = |hedgeRatio| (rare case)
+      if (result.hedgeRatio >= 0) {
+        addLeg({
+          symbol: result.symbol2,
+          coefficient: result.hedgeRatio,
+          side: "short",
+        });
+      } else {
+        addLeg({
+          symbol: result.symbol2,
+          coefficient: Math.abs(result.hedgeRatio),
+          side: "long",
+        });
+      }
+
+      // Switch to Synthetics tab
+      if (onSwitchTab) {
+        onSwitchTab("synthetics");
+      }
+
+      showToast(
+        `Synthetic created: ${result.symbol1.replace("USDT", "")} / ${result.symbol2.replace("USDT", "")} (HR: ${result.hedgeRatio.toFixed(4)})`
+      );
     },
-    [addLeg, clearLegs]
+    [addLeg, clearLegs, onSwitchTab, showToast]
+  );
+
+  // Open pair in Chart tab
+  const handleViewChart = useCallback(
+    (result: CointegrationResult) => {
+      setSelectedPair(result);
+      if (onSwitchTab) {
+        onSwitchTab("chart");
+      }
+    },
+    [setSelectedPair, onSwitchTab]
   );
 
   // Spread chart data
@@ -204,7 +263,14 @@ export default function ScreenerPanel() {
   };
 
   return (
-    <div className="flex gap-4 h-full">
+    <div className="flex gap-4 h-full relative">
+      {/* Toast notification */}
+      {toastMessage && (
+        <div className="absolute top-2 right-2 z-50 bg-cyan-600 text-white text-xs px-4 py-2 rounded-md shadow-lg animate-in fade-in slide-in-from-top-2">
+          {toastMessage}
+        </div>
+      )}
+
       {/* Main content */}
       <div className="flex-1 flex flex-col gap-4 min-w-0">
         {/* Scan Parameters */}
@@ -366,13 +432,17 @@ export default function ScreenerPanel() {
         {/* Results Table */}
         <Card className="bg-card/80 border-border/50 flex-1 min-h-0">
           <CardHeader className="pb-2">
-            <CardTitle className="text-sm font-medium text-muted-foreground">
+            <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-2">
               Scan Results
               {scanResults.length > 0 && (
                 <Badge variant="outline" className="ml-2 text-xs">
                   {scanResults.length} pairs
                 </Badge>
               )}
+              <Info className="h-3 w-3 text-muted-foreground/50 ml-1" />
+              <span className="text-[10px] text-muted-foreground/60 font-normal">
+                Hedge Ratio = coefficient for Short leg (spread = Long - HR * Short)
+              </span>
             </CardTitle>
           </CardHeader>
           <CardContent className="pt-0">
@@ -390,7 +460,13 @@ export default function ScreenerPanel() {
                       <TableHead className="text-xs h-8">Pair</TableHead>
                       <TableHead className="text-xs h-8">P-Value</TableHead>
                       <TableHead className="text-xs h-8">ADF Stat</TableHead>
-                      <TableHead className="text-xs h-8">Hedge Ratio</TableHead>
+                      <TableHead className="text-xs h-8">
+                        <div className="flex items-center gap-1">
+                          Hedge Ratio
+                          <Info className="h-2.5 w-2.5 text-muted-foreground/40" />
+                        </div>
+                      </TableHead>
+                      <TableHead className="text-xs h-8">Direction</TableHead>
                       <TableHead className="text-xs h-8">Half-Life</TableHead>
                       <TableHead className="text-xs h-8">Corr</TableHead>
                       <TableHead className="text-xs h-8">Z-Score</TableHead>
@@ -426,7 +502,21 @@ export default function ScreenerPanel() {
                           {result.adfStatistic.toFixed(3)}
                         </TableCell>
                         <TableCell className="text-xs font-mono py-1.5">
-                          {result.hedgeRatio.toFixed(4)}
+                          <Badge
+                            variant="outline"
+                            className="text-[10px] border-cyan-500/30 text-cyan-300 bg-cyan-500/10"
+                          >
+                            {result.hedgeRatio.toFixed(4)}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="text-xs py-1.5">
+                          <div className="flex items-center gap-1">
+                            <span className="text-emerald-400 text-[10px]">Long</span>
+                            <span className="text-muted-foreground text-[10px]">{result.symbol1.replace("USDT", "")}</span>
+                            <span className="text-muted-foreground text-[10px] mx-0.5">-</span>
+                            <span className="text-red-400 text-[10px]">Short</span>
+                            <span className="text-muted-foreground text-[10px]">{result.symbol2.replace("USDT", "")}</span>
+                          </div>
                         </TableCell>
                         <TableCell className="text-xs font-mono py-1.5">
                           {result.halfLife === Infinity
@@ -459,8 +549,9 @@ export default function ScreenerPanel() {
                               className="h-6 px-1.5 text-[10px] text-cyan-400 hover:text-cyan-300"
                               onClick={(e) => {
                                 e.stopPropagation();
-                                setSelectedPair(result);
+                                handleViewChart(result);
                               }}
+                              title="View Chart"
                             >
                               <TrendingUp className="h-3 w-3" />
                             </Button>
@@ -472,6 +563,7 @@ export default function ScreenerPanel() {
                                 e.stopPropagation();
                                 handleCreateSynthetic(result);
                               }}
+                              title="Create Synthetic (auto-fill legs)"
                             >
                               <Plus className="h-3 w-3" />
                             </Button>
@@ -524,7 +616,7 @@ export default function ScreenerPanel() {
                 </div>
                 <div className="bg-background/30 rounded p-2">
                   <div className="text-muted-foreground text-[10px]">Hedge Ratio</div>
-                  <div className="font-mono font-bold text-foreground">
+                  <div className="font-mono font-bold text-cyan-300">
                     {selectedPair.hedgeRatio.toFixed(4)}
                   </div>
                 </div>
@@ -552,6 +644,46 @@ export default function ScreenerPanel() {
                     {selectedPair.cointegrated ? "YES" : "NO"}
                   </div>
                 </div>
+              </div>
+
+              {/* Relationship explanation */}
+              <div className="mt-3 bg-background/20 rounded p-2 border border-border/20">
+                <div className="text-[10px] text-muted-foreground mb-1">Synthetic Formula</div>
+                <div className="text-xs font-mono text-cyan-300">
+                  Spread = 1.0 * {selectedPair.symbol1.replace("USDT", "")}{" "}
+                  {selectedPair.hedgeRatio >= 0 ? "-" : "+"}{" "}
+                  {Math.abs(selectedPair.hedgeRatio).toFixed(4)} * {selectedPair.symbol2.replace("USDT", "")}
+                </div>
+                <div className="text-[10px] text-muted-foreground mt-1.5">
+                  <span className="text-emerald-400">Long</span>{" "}
+                  {selectedPair.symbol1.replace("USDT", "")}
+                  {" + "}
+                  <span className="text-red-400">Short</span>{" "}
+                  {selectedPair.symbol2.replace("USDT", "")}
+                  {" x "}
+                  {selectedPair.hedgeRatio.toFixed(4)}
+                </div>
+              </div>
+
+              {/* Action buttons */}
+              <div className="mt-3 flex gap-2">
+                <Button
+                  onClick={() => handleCreateSynthetic(selectedPair)}
+                  size="sm"
+                  className="flex-1 h-7 text-xs bg-cyan-600 hover:bg-cyan-700 text-white"
+                >
+                  <Plus className="h-3 w-3 mr-1" />
+                  Create Synthetic
+                </Button>
+                <Button
+                  onClick={() => handleViewChart(selectedPair)}
+                  variant="outline"
+                  size="sm"
+                  className="flex-1 h-7 text-xs border-cyan-500/30 text-cyan-400"
+                >
+                  <ArrowRight className="h-3 w-3 mr-1" />
+                  Open Chart
+                </Button>
               </div>
             </CardContent>
           </Card>
