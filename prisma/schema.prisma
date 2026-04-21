@@ -1,0 +1,18 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model SyntheticInstrument {
+  id          String   @id @default(cuid())
+  name        String
+  description String?
+  type        String   // "pair" or "basket"
+  legs        String   // JSON string: [{symbol: "BTCUSDT", coefficient: 1.0, side: "long"}, ...]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
