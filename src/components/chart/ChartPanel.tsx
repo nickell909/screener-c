@@ -1,11 +1,10 @@
 "use client";
 
-import React, { useState, useMemo, useCallback } from "react";
+import React, { useState, useMemo, useCallback, useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useSyntheticStore, type SavedSynthetic } from "@/store/synthetic-store";
 import { useScreenerStore } from "@/store/screener-store";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import {
@@ -18,19 +17,19 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  ReferenceLine,
-  BarChart,
-  Bar,
-  ComposedChart,
-  Area,
-} from "recharts";
+  createChart,
+  LineSeries,
+  HistogramSeries,
+  AreaSeries,
+  ColorType,
+  CrosshairMode,
+  LineStyle,
+  type IChartApi,
+  type ISeriesApi,
+  type DeepPartial,
+  type ChartOptions,
+  type Time,
+} from "lightweight-charts";
 import {
   CandlestickChart,
   TrendingUp,
@@ -78,6 +77,570 @@ interface SyntheticChartData {
   };
 }
 
+// ============ Chart sub-component using lightweight-charts ============
+
+interface PairChartProps {
+  data: PairChartData;
+  showSpread: boolean;
+  showZScore: boolean;
+  showBB: boolean;
+}
+
+function PairChart({ data, showSpread, showZScore, showBB }: PairChartProps) {
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+  const seriesRef = useRef<{
+    spread?: ISeriesApi<"Line">;
+    bbUpper?: ISeriesApi<"Line">;
+    bbLower?: ISeriesApi<"Line">;
+    bbFill?: ISeriesApi<"Area">;
+    zScore?: ISeriesApi<"Line">;
+    zScoreFill?: ISeriesApi<"Area">;
+    meanLine?: ISeriesApi<"Line">;
+  }>({});
+
+  // Prepare chart data
+  const chartData = useMemo(() => {
+    if (!data?.spread) return null;
+
+    const spreadData: { time: Time; value: number }[] = [];
+    const bbUpperData: { time: Time; value: number }[] = [];
+    const bbLowerData: { time: Time; value: number }[] = [];
+    const bbFillTopData: { time: Time; value: number }[] = [];
+    const bbFillBottomData: { time: Time; value: number }[] = [];
+    const zScoreData: { time: Time; value: number }[] = [];
+    const zScoreFillData: { time: Time; value: number }[] = [];
+    const meanData: { time: Time; value: number }[] = [];
+
+    const mean = data.stats.mean;
+
+    for (let i = 0; i < data.spread.length; i++) {
+      const kline = data.klines1?.[i];
+      if (!kline) continue;
+      const time = Math.floor(kline.timestamp / 1000) as Time;
+
+      spreadData.push({ time, value: data.spread[i] });
+      meanData.push({ time, value: mean });
+
+      // Bollinger Bands
+      const bbU = data.bollingerBands?.upper?.[i];
+      const bbL = data.bollingerBands?.lower?.[i];
+      if (bbU !== null && bbU !== undefined) {
+        bbUpperData.push({ time, value: bbU });
+      }
+      if (bbL !== null && bbL !== undefined) {
+        bbLowerData.push({ time, value: bbL });
+      }
+
+      // Z-Score
+      if (data.zScore?.[i] !== undefined) {
+        zScoreData.push({ time, value: data.zScore[i] });
+        zScoreFillData.push({ time, value: data.zScore[i] });
+      }
+    }
+
+    return {
+      spreadData,
+      bbUpperData,
+      bbLowerData,
+      zScoreData,
+      zScoreFillData,
+      meanData,
+    };
+  }, [data]);
+
+  // Create and update chart
+  useEffect(() => {
+    if (!chartContainerRef.current || !chartData) return;
+
+    // Clean up previous chart
+    if (chartRef.current) {
+      chartRef.current.remove();
+      chartRef.current = null;
+      seriesRef.current = {};
+    }
+
+    const chart = createChart(chartContainerRef.current, {
+      layout: {
+        background: { type: ColorType.Solid, color: "transparent" },
+        textColor: "rgba(255,255,255,0.5)",
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: "rgba(255,255,255,0.04)" },
+        horzLines: { color: "rgba(255,255,255,0.04)" },
+      },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: {
+          color: "rgba(6,182,212,0.4)",
+          width: 1,
+          style: LineStyle.Dashed,
+          labelBackgroundColor: "rgba(6,182,212,0.8)",
+        },
+        horzLine: {
+          color: "rgba(6,182,212,0.4)",
+          width: 1,
+          style: LineStyle.Dashed,
+          labelBackgroundColor: "rgba(6,182,212,0.8)",
+        },
+      },
+      rightPriceScale: {
+        borderColor: "rgba(255,255,255,0.1)",
+        scaleMargins: { top: 0.1, bottom: 0.1 },
+      },
+      timeScale: {
+        borderColor: "rgba(255,255,255,0.1)",
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 5,
+        barSpacing: 8,
+        minBarSpacing: 2,
+      },
+      handleScroll: { vertTouchDrag: false },
+    } as DeepPartial<ChartOptions>);
+
+    chartRef.current = chart;
+
+    // ---- Main Pane (pane 0): Spread + BB + Mean ----
+
+    // Mean reference line
+    if (showSpread) {
+      const meanSeries = chart.addSeries(LineSeries, {
+        color: "rgba(255,255,255,0.2)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      meanSeries.setData(chartData.meanData);
+      seriesRef.current.meanLine = meanSeries;
+    }
+
+    // Bollinger Bands - fill area
+    if (showBB && chartData.bbUpperData.length > 0) {
+      // BB Upper line
+      const bbUpperSeries = chart.addSeries(LineSeries, {
+        color: "rgba(239,68,68,0.35)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      bbUpperSeries.setData(chartData.bbUpperData);
+      seriesRef.current.bbUpper = bbUpperSeries;
+
+      // BB Lower line
+      const bbLowerSeries = chart.addSeries(LineSeries, {
+        color: "rgba(239,68,68,0.35)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      bbLowerSeries.setData(chartData.bbLowerData);
+      seriesRef.current.bbLower = bbLowerSeries;
+
+      // BB Fill - use area series with upper band data, base value at lower band
+      // We'll use a semi-transparent area on the upper band
+      const bbFillSeries = chart.addSeries(AreaSeries, {
+        topColor: "rgba(239,68,68,0.08)",
+        bottomColor: "rgba(239,68,68,0.02)",
+        lineColor: "transparent",
+        lineWidth: 1,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      bbFillSeries.setData(chartData.bbUpperData);
+      seriesRef.current.bbFill = bbFillSeries;
+    }
+
+    // Spread line
+    if (showSpread) {
+      const spreadSeries = chart.addSeries(LineSeries, {
+        color: "#06b6d4",
+        lineWidth: 2,
+        priceLineVisible: true,
+        lastValueVisible: true,
+        crosshairMarkerRadius: 4,
+      });
+      spreadSeries.setData(chartData.spreadData);
+      seriesRef.current.spread = spreadSeries;
+    }
+
+    // ---- Z-Score Pane (pane 1) ----
+    if (showZScore && chartData.zScoreData.length > 0) {
+      const zScorePane = chart.addPane();
+      zScorePane.setStretchFactor(0.3);
+
+      // Z-Score area fill
+      const zScoreFillSeries = chart.addSeries(AreaSeries, {
+        topColor: "rgba(167,139,250,0.15)",
+        bottomColor: "rgba(167,139,250,0.02)",
+        lineColor: "transparent",
+        lineWidth: 1,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      }, 1);
+      zScoreFillSeries.setData(chartData.zScoreFillData);
+      seriesRef.current.zScoreFill = zScoreFillSeries;
+
+      // Z-Score line
+      const zScoreSeries = chart.addSeries(LineSeries, {
+        color: "#a78bfa",
+        lineWidth: 2,
+        priceLineVisible: true,
+        lastValueVisible: true,
+        crosshairMarkerRadius: 3,
+        priceScaleId: "zscore",
+      }, 1);
+      zScoreSeries.setData(chartData.zScoreData);
+
+      // Reference lines for Z-Score at ±2
+      zScoreSeries.createPriceLine({
+        price: 2,
+        color: "rgba(239,68,68,0.3)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "+2",
+      });
+      zScoreSeries.createPriceLine({
+        price: -2,
+        color: "rgba(239,68,68,0.3)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "-2",
+      });
+      zScoreSeries.createPriceLine({
+        price: 0,
+        color: "rgba(255,255,255,0.15)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "0",
+      });
+
+      seriesRef.current.zScore = zScoreSeries;
+
+      // Configure z-score price scale
+      const zScorePriceScale = chart.priceScale("zscore", 1);
+      zScorePriceScale.applyOptions({
+        scaleMargins: { top: 0.1, bottom: 0.1 },
+        borderVisible: true,
+        borderColor: "rgba(255,255,255,0.1)",
+      });
+    }
+
+    // Fit content
+    chart.timeScale().fitContent();
+
+    // Handle resize
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        chart.applyOptions({ width, height });
+      }
+    });
+    resizeObserver.observe(chartContainerRef.current);
+
+    return () => {
+      resizeObserver.disconnect();
+      chart.remove();
+      chartRef.current = null;
+      seriesRef.current = {};
+    };
+  }, [chartData, showSpread, showZScore, showBB]);
+
+  return (
+    <div
+      ref={chartContainerRef}
+      className="w-full h-full min-h-[400px]"
+    />
+  );
+}
+
+interface SyntheticChartProps {
+  data: SyntheticChartData;
+  showZScore: boolean;
+  showBB: boolean;
+}
+
+function SyntheticChart({ data, showZScore, showBB }: SyntheticChartProps) {
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<IChartApi | null>(null);
+
+  // Prepare chart data
+  const chartData = useMemo(() => {
+    if (!data?.klines) return null;
+
+    const klines = data.klines;
+    const mean = data.stats.mean;
+    const stdDev = data.stats.stdDev;
+    const bbPeriod = 20;
+    const bbMultiplier = 2;
+
+    const closeData: { time: Time; value: number }[] = [];
+    const meanData: { time: Time; value: number }[] = [];
+    const bbUpperData: { time: Time; value: number }[] = [];
+    const bbLowerData: { time: Time; value: number }[] = [];
+    const zScoreData: { time: Time; value: number }[] = [];
+    const volumeData: { time: Time; value: number; color: string }[] = [];
+
+    for (let i = 0; i < klines.length; i++) {
+      const kline = klines[i];
+      const time = Math.floor(kline.timestamp / 1000) as Time;
+
+      closeData.push({ time, value: kline.close });
+      meanData.push({ time, value: mean });
+
+      // Bollinger Bands
+      if (showBB && i >= bbPeriod - 1) {
+        const slice = klines.slice(i - bbPeriod + 1, i + 1).map((k) => k.close);
+        const m = slice.reduce((s, v) => s + v, 0) / slice.length;
+        const v = slice.reduce((s, val) => s + (val - m) ** 2, 0) / (slice.length - 1);
+        const sd = Math.sqrt(v);
+        bbUpperData.push({ time, value: m + bbMultiplier * sd });
+        bbLowerData.push({ time, value: m - bbMultiplier * sd });
+      }
+
+      // Z-Score
+      const zs = stdDev > 0 ? (kline.close - mean) / stdDev : 0;
+      zScoreData.push({ time, value: zs });
+
+      // Volume
+      const volColor = kline.close >= kline.open
+        ? "rgba(6,182,212,0.3)"
+        : "rgba(239,68,68,0.3)";
+      volumeData.push({ time, value: kline.volume, color: volColor });
+    }
+
+    return {
+      closeData,
+      meanData,
+      bbUpperData,
+      bbLowerData,
+      zScoreData,
+      volumeData,
+    };
+  }, [data, showBB]);
+
+  // Create and update chart
+  useEffect(() => {
+    if (!chartContainerRef.current || !chartData) return;
+
+    // Clean up previous chart
+    if (chartRef.current) {
+      chartRef.current.remove();
+      chartRef.current = null;
+    }
+
+    const chart = createChart(chartContainerRef.current, {
+      layout: {
+        background: { type: ColorType.Solid, color: "transparent" },
+        textColor: "rgba(255,255,255,0.5)",
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: "rgba(255,255,255,0.04)" },
+        horzLines: { color: "rgba(255,255,255,0.04)" },
+      },
+      crosshair: {
+        mode: CrosshairMode.Normal,
+        vertLine: {
+          color: "rgba(6,182,212,0.4)",
+          width: 1,
+          style: LineStyle.Dashed,
+          labelBackgroundColor: "rgba(6,182,212,0.8)",
+        },
+        horzLine: {
+          color: "rgba(6,182,212,0.4)",
+          width: 1,
+          style: LineStyle.Dashed,
+          labelBackgroundColor: "rgba(6,182,212,0.8)",
+        },
+      },
+      rightPriceScale: {
+        borderColor: "rgba(255,255,255,0.1)",
+        scaleMargins: { top: 0.1, bottom: 0.2 },
+      },
+      timeScale: {
+        borderColor: "rgba(255,255,255,0.1)",
+        timeVisible: true,
+        secondsVisible: false,
+        rightOffset: 5,
+        barSpacing: 8,
+        minBarSpacing: 2,
+      },
+      handleScroll: { vertTouchDrag: false },
+    } as DeepPartial<ChartOptions>);
+
+    chartRef.current = chart;
+
+    // ---- Main Pane (pane 0): Close + BB + Mean ----
+
+    // Mean reference line
+    const meanSeries = chart.addSeries(LineSeries, {
+      color: "rgba(255,255,255,0.2)",
+      lineWidth: 1,
+      lineStyle: LineStyle.Dashed,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+    });
+    meanSeries.setData(chartData.meanData);
+
+    // Bollinger Bands
+    if (showBB && chartData.bbUpperData.length > 0) {
+      const bbUpperSeries = chart.addSeries(LineSeries, {
+        color: "rgba(239,68,68,0.35)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      bbUpperSeries.setData(chartData.bbUpperData);
+
+      const bbLowerSeries = chart.addSeries(LineSeries, {
+        color: "rgba(239,68,68,0.35)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      bbLowerSeries.setData(chartData.bbLowerData);
+
+      // BB fill area
+      const bbFillSeries = chart.addSeries(AreaSeries, {
+        topColor: "rgba(239,68,68,0.08)",
+        bottomColor: "rgba(239,68,68,0.02)",
+        lineColor: "transparent",
+        lineWidth: 1,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      });
+      bbFillSeries.setData(chartData.bbUpperData);
+    }
+
+    // Close price line
+    const closeSeries = chart.addSeries(LineSeries, {
+      color: "#06b6d4",
+      lineWidth: 2,
+      priceLineVisible: true,
+      lastValueVisible: true,
+      crosshairMarkerRadius: 4,
+    });
+    closeSeries.setData(chartData.closeData);
+
+    // ---- Volume Pane (pane 1) ----
+    const volumePane = chart.addPane();
+    volumePane.setStretchFactor(0.15);
+
+    const volumeSeries = chart.addSeries(HistogramSeries, {
+      priceLineVisible: false,
+      lastValueVisible: false,
+      priceScaleId: "volume",
+    }, 1);
+    volumeSeries.setData(chartData.volumeData);
+
+    chart.priceScale("volume", 1).applyOptions({
+      scaleMargins: { top: 0.0, bottom: 0.0 },
+      borderVisible: false,
+      visible: false,
+    });
+
+    // ---- Z-Score Pane (pane 2) ----
+    if (showZScore && chartData.zScoreData.length > 0) {
+      const zScorePane = chart.addPane();
+      zScorePane.setStretchFactor(0.25);
+
+      // Z-Score area fill
+      const zScoreFillSeries = chart.addSeries(AreaSeries, {
+        topColor: "rgba(167,139,250,0.15)",
+        bottomColor: "rgba(167,139,250,0.02)",
+        lineColor: "transparent",
+        lineWidth: 1,
+        priceLineVisible: false,
+        lastValueVisible: false,
+        crosshairMarkerVisible: false,
+      }, 2);
+      zScoreFillSeries.setData(chartData.zScoreData);
+
+      // Z-Score line
+      const zScoreSeries = chart.addSeries(LineSeries, {
+        color: "#a78bfa",
+        lineWidth: 2,
+        priceLineVisible: true,
+        lastValueVisible: true,
+        crosshairMarkerRadius: 3,
+      }, 2);
+      zScoreSeries.setData(chartData.zScoreData);
+
+      // Reference lines
+      zScoreSeries.createPriceLine({
+        price: 2,
+        color: "rgba(239,68,68,0.3)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "+2",
+      });
+      zScoreSeries.createPriceLine({
+        price: -2,
+        color: "rgba(239,68,68,0.3)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "-2",
+      });
+      zScoreSeries.createPriceLine({
+        price: 0,
+        color: "rgba(255,255,255,0.15)",
+        lineWidth: 1,
+        lineStyle: LineStyle.Dashed,
+        axisLabelVisible: true,
+        title: "0",
+      });
+    }
+
+    // Fit content
+    chart.timeScale().fitContent();
+
+    // Handle resize
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const { width, height } = entry.contentRect;
+        chart.applyOptions({ width, height });
+      }
+    });
+    resizeObserver.observe(chartContainerRef.current);
+
+    return () => {
+      resizeObserver.disconnect();
+      chart.remove();
+      chartRef.current = null;
+    };
+  }, [chartData, showZScore, showBB]);
+
+  return (
+    <div
+      ref={chartContainerRef}
+      className="w-full h-full min-h-[400px]"
+    />
+  );
+}
+
+// ============ Main ChartPanel component ============
+
 export default function ChartPanel() {
   const {
     activeSyntheticId,
@@ -89,29 +652,19 @@ export default function ChartPanel() {
 
   const { selectedPair, scanInterval } = useScreenerStore();
 
-  const [chartMode, setChartMode] = useState<"pair" | "synthetic">(
-    selectedPair ? "pair" : "synthetic"
-  );
-  const [pairSymbol1, setPairSymbol1] = useState(
-    selectedPair?.symbol1 || "BTCUSDT"
-  );
-  const [pairSymbol2, setPairSymbol2] = useState(
-    selectedPair?.symbol2 || "ETHUSDT"
-  );
+  const [chartMode, setChartMode] = useState<"pair" | "synthetic">("pair");
+  const [pairSymbol1Input, setPairSymbol1Input] = useState("BTCUSDT");
+  const [pairSymbol2Input, setPairSymbol2Input] = useState("ETHUSDT");
   const [showSpread, setShowSpread] = useState(true);
   const [showZScore, setShowZScore] = useState(false);
   const [showBB, setShowBB] = useState(true);
 
-  const currentInterval = chartInterval || scanInterval;
+  // When selectedPair changes (from Screener), switch to pair mode
+  const effectiveMode = selectedPair ? "pair" : chartMode;
+  const pairSymbol1 = selectedPair?.symbol1 || pairSymbol1Input;
+  const pairSymbol2 = selectedPair?.symbol2 || pairSymbol2Input;
 
-  // When selectedPair changes (from Screener), update chart inputs and switch to pair mode
-  React.useEffect(() => {
-    if (selectedPair) {
-      setPairSymbol1(selectedPair.symbol1);
-      setPairSymbol2(selectedPair.symbol2);
-      setChartMode("pair");
-    }
-  }, [selectedPair]);
+  const currentInterval = chartInterval || scanInterval;
 
   // Fetch pair chart data
   const { data: pairData, isLoading: pairLoading } = useQuery<PairChartData>({
@@ -121,12 +674,12 @@ export default function ChartPanel() {
         symbol1: pairSymbol1,
         symbol2: pairSymbol2,
         interval: currentInterval,
-        limit: "200",
+        limit: "500",
       });
       const res = await fetch(`/api/pair-chart?${params}`);
       return res.json();
     },
-    enabled: chartMode === "pair",
+    enabled: effectiveMode === "pair",
     staleTime: 60 * 1000,
   });
 
@@ -137,83 +690,14 @@ export default function ChartPanel() {
       if (!activeSyntheticId) return null as unknown as SyntheticChartData;
       const params = new URLSearchParams({
         interval: currentInterval,
-        limit: "200",
+        limit: "500",
       });
       const res = await fetch(`/api/synthetics/${activeSyntheticId}/chart?${params}`);
       return res.json();
     },
-    enabled: chartMode === "synthetic" && !!activeSyntheticId,
+    enabled: effectiveMode === "synthetic" && !!activeSyntheticId,
     staleTime: 60 * 1000,
   });
-
-  // Build pair chart data
-  const pairChartData = useMemo(() => {
-    if (!pairData?.spread) return [];
-
-    return pairData.spread.map((val: number, i: number) => {
-      const kline1 = pairData.klines1?.[i];
-      const kline2 = pairData.klines2?.[i];
-      const bb = pairData.bollingerBands;
-
-      return {
-        index: i,
-        time: kline1 ? new Date(kline1.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : String(i),
-        spread: val,
-        zScore: pairData.zScore?.[i] ?? 0,
-        price1: kline1?.close ?? 0,
-        price2: kline2?.close ?? 0,
-        volume1: kline1?.volume ?? 0,
-        bbUpper: bb?.upper?.[i],
-        bbMiddle: bb?.middle?.[i],
-        bbLower: bb?.lower?.[i],
-      };
-    });
-  }, [pairData]);
-
-  // Build synthetic chart data
-  const syntheticChartData = useMemo(() => {
-    if (!syntheticData?.klines) return [];
-
-    const klines = syntheticData.klines;
-    const mean = syntheticData.stats.mean;
-    const stdDev = syntheticData.stats.stdDev;
-
-    // Calculate Bollinger Bands
-    const bbPeriod = 20;
-    const bbMultiplier = 2;
-
-    return klines.map((kline, i) => {
-      let bbUpper: number | null = null;
-      let bbMiddle: number | null = null;
-      let bbLower: number | null = null;
-
-      if (i >= bbPeriod - 1) {
-        const slice = klines.slice(i - bbPeriod + 1, i + 1).map((k) => k.close);
-        const m = slice.reduce((s, v) => s + v, 0) / slice.length;
-        const v = slice.reduce((s, val) => s + (val - m) ** 2, 0) / (slice.length - 1);
-        const sd = Math.sqrt(v);
-        bbMiddle = m;
-        bbUpper = m + bbMultiplier * sd;
-        bbLower = m - bbMultiplier * sd;
-      }
-
-      const zs = stdDev > 0 ? (kline.close - mean) / stdDev : 0;
-
-      return {
-        index: i,
-        time: new Date(kline.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        open: kline.open,
-        high: kline.high,
-        low: kline.low,
-        close: kline.close,
-        volume: kline.volume,
-        zScore: zs,
-        bbUpper,
-        bbMiddle,
-        bbLower,
-      };
-    });
-  }, [syntheticData]);
 
   const handleSelectSynthetic = useCallback(
     (id: string) => {
@@ -223,16 +707,16 @@ export default function ChartPanel() {
     [setActiveSyntheticId]
   );
 
-  const isLoading = chartMode === "pair" ? pairLoading : syntheticLoading;
+  const isLoading = effectiveMode === "pair" ? pairLoading : syntheticLoading;
 
   return (
-    <div className="flex gap-4 h-full">
+    <div className="flex gap-3 h-full overflow-hidden">
       {/* Chart sidebar */}
-      <div className="w-56 flex-shrink-0 flex flex-col gap-3">
+      <div className="w-52 flex-shrink-0 flex flex-col gap-2.5 overflow-y-auto">
         {/* Mode selector */}
         <Card className="bg-card/80 border-border/50">
-          <CardContent className="p-3">
-            <Tabs value={chartMode} onValueChange={(v) => setChartMode(v as "pair" | "synthetic")}>
+          <CardContent className="p-2.5">
+            <Tabs value={effectiveMode} onValueChange={(v) => setChartMode(v as "pair" | "synthetic")}>
               <TabsList className="w-full h-8">
                 <TabsTrigger value="pair" className="text-xs flex-1">Pair</TabsTrigger>
                 <TabsTrigger value="synthetic" className="text-xs flex-1">Synthetic</TabsTrigger>
@@ -242,17 +726,17 @@ export default function ChartPanel() {
         </Card>
 
         {/* Pair selectors */}
-        {chartMode === "pair" && (
+        {effectiveMode === "pair" && (
           <Card className="bg-card/80 border-border/50">
-            <CardHeader className="pb-2">
+            <CardHeader className="pb-1.5">
               <CardTitle className="text-xs font-medium text-muted-foreground">Select Pair</CardTitle>
             </CardHeader>
-            <CardContent className="space-y-2">
+            <CardContent className="space-y-2 pt-0">
               <div className="space-y-1">
                 <label className="text-[10px] text-muted-foreground">Symbol 1</label>
                 <Input
                   value={pairSymbol1}
-                  onChange={(e) => setPairSymbol1(e.target.value.toUpperCase())}
+                  onChange={(e) => setPairSymbol1Input(e.target.value.toUpperCase())}
                   className="h-7 text-xs font-mono bg-background/50"
                   placeholder="BTCUSDT"
                 />
@@ -261,7 +745,7 @@ export default function ChartPanel() {
                 <label className="text-[10px] text-muted-foreground">Symbol 2</label>
                 <Input
                   value={pairSymbol2}
-                  onChange={(e) => setPairSymbol2(e.target.value.toUpperCase())}
+                  onChange={(e) => setPairSymbol2Input(e.target.value.toUpperCase())}
                   className="h-7 text-xs font-mono bg-background/50"
                   placeholder="ETHUSDT"
                 />
@@ -271,12 +755,12 @@ export default function ChartPanel() {
         )}
 
         {/* Synthetic selector */}
-        {chartMode === "synthetic" && (
+        {effectiveMode === "synthetic" && (
           <Card className="bg-card/80 border-border/50">
-            <CardHeader className="pb-2">
+            <CardHeader className="pb-1.5">
               <CardTitle className="text-xs font-medium text-muted-foreground">Select Synthetic</CardTitle>
             </CardHeader>
-            <CardContent>
+            <CardContent className="pt-0">
               <ScrollArea className="max-h-40">
                 <div className="space-y-1">
                   {savedSynthetics.length === 0 ? (
@@ -306,10 +790,10 @@ export default function ChartPanel() {
 
         {/* Interval selector */}
         <Card className="bg-card/80 border-border/50">
-          <CardHeader className="pb-2">
+          <CardHeader className="pb-1.5">
             <CardTitle className="text-xs font-medium text-muted-foreground">Timeframe</CardTitle>
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0">
             <Select value={currentInterval} onValueChange={setChartInterval}>
               <SelectTrigger className="h-7 text-xs">
                 <SelectValue />
@@ -335,22 +819,24 @@ export default function ChartPanel() {
 
         {/* Overlay toggles */}
         <Card className="bg-card/80 border-border/50">
-          <CardHeader className="pb-2">
+          <CardHeader className="pb-1.5">
             <CardTitle className="text-xs font-medium text-muted-foreground">Overlays</CardTitle>
           </CardHeader>
-          <CardContent>
+          <CardContent className="pt-0">
             <div className="space-y-1.5">
-              <button
-                onClick={() => setShowSpread(!showSpread)}
-                className={`w-full text-left px-2 py-1 rounded text-xs transition-colors ${
-                  showSpread
-                    ? "bg-cyan-500/20 text-cyan-300"
-                    : "bg-background/30 text-muted-foreground"
-                }`}
-              >
-                <TrendingUp className="h-3 w-3 inline mr-1.5" />
-                Spread Line
-              </button>
+              {effectiveMode === "pair" && (
+                <button
+                  onClick={() => setShowSpread(!showSpread)}
+                  className={`w-full text-left px-2 py-1 rounded text-xs transition-colors ${
+                    showSpread
+                      ? "bg-cyan-500/20 text-cyan-300"
+                      : "bg-background/30 text-muted-foreground"
+                  }`}
+                >
+                  <TrendingUp className="h-3 w-3 inline mr-1.5" />
+                  Spread Line
+                </button>
+              )}
               <button
                 onClick={() => setShowZScore(!showZScore)}
                 className={`w-full text-left px-2 py-1 rounded text-xs transition-colors ${
@@ -376,20 +862,122 @@ export default function ChartPanel() {
             </div>
           </CardContent>
         </Card>
+
+        {/* Stats panel */}
+        {effectiveMode === "pair" && pairData && !isLoading && (
+          <Card className="bg-card/80 border-border/50">
+            <CardHeader className="pb-1.5">
+              <CardTitle className="text-xs font-medium text-muted-foreground">Statistics</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-0 space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">P-Value</span>
+                <span className="text-xs font-mono font-bold text-foreground">
+                  {pairData.cointegration.pValue.toFixed(4)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Last Spread</span>
+                <span className="text-xs font-mono font-bold text-foreground">
+                  {pairData.stats.lastSpread.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Z-Score</span>
+                <span className={`text-xs font-mono font-bold ${
+                  Math.abs(pairData.stats.lastZScore) > 2 ? "text-yellow-400" : "text-foreground"
+                }`}>
+                  {pairData.stats.lastZScore.toFixed(3)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Mean</span>
+                <span className="text-xs font-mono text-foreground">
+                  {pairData.stats.mean.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Std Dev</span>
+                <span className="text-xs font-mono text-foreground">
+                  {pairData.stats.stdDev.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Half-Life</span>
+                <span className="text-xs font-mono text-foreground">
+                  {pairData.cointegration.halfLife === Infinity
+                    ? "∞"
+                    : `${pairData.cointegration.halfLife.toFixed(1)} bars`}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Hedge Ratio</span>
+                <span className="text-xs font-mono text-foreground">
+                  {pairData.cointegration.hedgeRatio.toFixed(4)}
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        )}
+
+        {effectiveMode === "synthetic" && syntheticData && !isLoading && (
+          <Card className="bg-card/80 border-border/50">
+            <CardHeader className="pb-1.5">
+              <CardTitle className="text-xs font-medium text-muted-foreground">Statistics</CardTitle>
+            </CardHeader>
+            <CardContent className="pt-0 space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Last Price</span>
+                <span className="text-xs font-mono font-bold text-foreground">
+                  {syntheticData.stats.lastPrice.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Z-Score</span>
+                <span className={`text-xs font-mono font-bold ${
+                  Math.abs(syntheticData.stats.lastZScore) > 2 ? "text-yellow-400" : "text-foreground"
+                }`}>
+                  {syntheticData.stats.lastZScore.toFixed(3)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Mean</span>
+                <span className="text-xs font-mono text-foreground">
+                  {syntheticData.stats.mean.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">Std Dev</span>
+                <span className="text-xs font-mono text-foreground">
+                  {syntheticData.stats.stdDev.toFixed(2)}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[10px] text-muted-foreground">% Dev</span>
+                <span className={`text-xs font-mono font-bold ${
+                  Math.abs(syntheticData.stats.percentDeviation) > 5 ? "text-yellow-400" : "text-foreground"
+                }`}>
+                  {syntheticData.stats.percentDeviation.toFixed(2)}%
+                </span>
+              </div>
+            </CardContent>
+          </Card>
+        )}
       </div>
 
       {/* Main chart area */}
-      <div className="flex-1 flex flex-col gap-4 min-w-0">
+      <div className="flex-1 flex flex-col gap-2 min-w-0 min-h-0">
+        {/* Chart header */}
         {isLoading ? (
           <Card className="bg-card/80 border-border/50 flex-1">
             <CardContent className="flex items-center justify-center h-full">
-              <div className="text-muted-foreground text-sm">Loading chart data...</div>
+              <div className="text-muted-foreground text-sm animate-pulse">Loading chart data...</div>
             </CardContent>
           </Card>
-        ) : chartMode === "pair" && pairData ? (
-          <>
-            {/* Chart header */}
-            <div className="flex items-center gap-3">
+        ) : effectiveMode === "pair" && pairData ? (
+          <div className="flex-1 flex flex-col min-h-0">
+            {/* Header */}
+            <div className="flex items-center gap-3 mb-2 flex-shrink-0">
               <h2 className="text-lg font-semibold">
                 <span className="text-cyan-300">{pairSymbol1.replace("USDT", "")}</span>
                 <span className="text-muted-foreground mx-1">/</span>
@@ -398,12 +986,12 @@ export default function ChartPanel() {
               <Badge
                 variant="outline"
                 className={`text-[10px] ${
-                  pairData.cointegrated
+                  pairData.cointegration.cointegrated
                     ? "border-emerald-500/30 text-emerald-400"
                     : "border-red-500/30 text-red-400"
                 }`}
               >
-                {pairData.cointegrated ? "COINTEGRATED" : "NOT COINTEGRATED"}
+                {pairData.cointegration.cointegrated ? "COINTEGRATED" : "NOT COINTEGRATED"}
               </Badge>
               <Badge variant="outline" className="text-[10px] border-border/30 text-muted-foreground">
                 P={pairData.cointegration.pValue.toFixed(4)}
@@ -411,178 +999,24 @@ export default function ChartPanel() {
               <Badge variant="outline" className="text-[10px] border-border/30 text-muted-foreground">
                 HL={pairData.cointegration.halfLife === Infinity ? "∞" : `${pairData.cointegration.halfLife.toFixed(1)}`}
               </Badge>
+              <Badge variant="outline" className="text-[10px] border-border/30 text-muted-foreground">
+                β={pairData.cointegration.hedgeRatio.toFixed(4)}
+              </Badge>
             </div>
-
-            {/* Spread chart */}
-            <Card className="bg-card/80 border-border/50 flex-1 min-h-0">
-              <CardContent className="p-2">
-                <ResponsiveContainer width="100%" height={350}>
-                  <ComposedChart data={pairChartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                    <XAxis
-                      dataKey="time"
-                      tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                      axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                      interval="preserveStartEnd"
-                    />
-                    <YAxis
-                      tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                      axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                      width={70}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: "rgba(15,23,42,0.95)",
-                        border: "1px solid rgba(6,182,212,0.3)",
-                        borderRadius: "6px",
-                        fontSize: "10px",
-                      }}
-                    />
-                    <ReferenceLine y={pairData.stats.mean} stroke="rgba(255,255,255,0.2)" strokeDasharray="3 3" />
-                    {showBB && (
-                      <>
-                        <Area
-                          dataKey="bbUpper"
-                          stroke="none"
-                          fill="rgba(239,68,68,0.05)"
-                          name="BB Upper"
-                          connectNulls={false}
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="bbUpper"
-                          stroke="rgba(239,68,68,0.3)"
-                          strokeWidth={1}
-                          strokeDasharray="3 3"
-                          dot={false}
-                          name="BB Upper"
-                          connectNulls={false}
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="bbLower"
-                          stroke="rgba(239,68,68,0.3)"
-                          strokeWidth={1}
-                          strokeDasharray="3 3"
-                          dot={false}
-                          name="BB Lower"
-                          connectNulls={false}
-                        />
-                      </>
-                    )}
-                    {showSpread && (
-                      <Line
-                        type="monotone"
-                        dataKey="spread"
-                        stroke="#06b6d4"
-                        strokeWidth={1.5}
-                        dot={false}
-                        name="Spread"
-                      />
-                    )}
-                  </ComposedChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
-
-            {/* Z-Score chart */}
-            {showZScore && (
-              <Card className="bg-card/80 border-border/50">
-                <CardHeader className="pb-1">
-                  <CardTitle className="text-xs font-medium text-muted-foreground">
-                    Z-Score
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="pt-0 p-2">
-                  <ResponsiveContainer width="100%" height={140}>
-                    <LineChart data={pairChartData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                      <XAxis
-                        dataKey="time"
-                        tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                        axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                        interval="preserveStartEnd"
-                      />
-                      <YAxis
-                        tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                        axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                        width={40}
-                      />
-                      <Tooltip
-                        contentStyle={{
-                          backgroundColor: "rgba(15,23,42,0.95)",
-                          border: "1px solid rgba(6,182,212,0.3)",
-                          borderRadius: "6px",
-                          fontSize: "10px",
-                        }}
-                      />
-                      <ReferenceLine y={0} stroke="rgba(255,255,255,0.15)" strokeDasharray="3 3" />
-                      <ReferenceLine y={2} stroke="rgba(239,68,68,0.3)" strokeDasharray="3 3" />
-                      <ReferenceLine y={-2} stroke="rgba(239,68,68,0.3)" strokeDasharray="3 3" />
-                      <Line
-                        type="monotone"
-                        dataKey="zScore"
-                        stroke="#a78bfa"
-                        strokeWidth={1.5}
-                        dot={false}
-                        name="Z-Score"
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </CardContent>
-              </Card>
-            )}
-
-            {/* Statistics panel */}
-            <Card className="bg-card/80 border-border/50">
-              <CardContent className="p-3">
-                <div className="grid grid-cols-5 gap-3">
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Last Spread</div>
-                    <div className="text-sm font-mono font-bold text-foreground">
-                      {pairData.stats.lastSpread.toFixed(2)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Z-Score</div>
-                    <div
-                      className={`text-sm font-mono font-bold ${
-                        Math.abs(pairData.stats.lastZScore) > 2
-                          ? "text-yellow-400"
-                          : "text-foreground"
-                      }`}
-                    >
-                      {pairData.stats.lastZScore.toFixed(3)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Mean</div>
-                    <div className="text-sm font-mono text-foreground">
-                      {pairData.stats.mean.toFixed(2)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Std Dev</div>
-                    <div className="text-sm font-mono text-foreground">
-                      {pairData.stats.stdDev.toFixed(2)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Half-Life</div>
-                    <div className="text-sm font-mono text-foreground">
-                      {pairData.cointegration.halfLife === Infinity
-                        ? "∞"
-                        : `${pairData.cointegration.halfLife.toFixed(1)} bars`}
-                    </div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </>
-        ) : chartMode === "synthetic" && syntheticData ? (
-          <>
-            {/* Synthetic chart header */}
-            <div className="flex items-center gap-3">
+            {/* Chart */}
+            <div className="flex-1 min-h-0 rounded-lg overflow-hidden border border-border/30 bg-[#0a0e17]">
+              <PairChart
+                data={pairData}
+                showSpread={showSpread}
+                showZScore={showZScore}
+                showBB={showBB}
+              />
+            </div>
+          </div>
+        ) : effectiveMode === "synthetic" && syntheticData ? (
+          <div className="flex-1 flex flex-col min-h-0">
+            {/* Header */}
+            <div className="flex items-center gap-3 mb-2 flex-shrink-0">
               <Layers className="h-5 w-5 text-cyan-400" />
               <h2 className="text-lg font-semibold text-cyan-300">
                 {syntheticData.synthetic.name}
@@ -591,187 +1025,22 @@ export default function ChartPanel() {
                 {syntheticData.synthetic.type}
               </Badge>
             </div>
-
-            {/* Synthetic line chart */}
-            <Card className="bg-card/80 border-border/50 flex-1 min-h-0">
-              <CardContent className="p-2">
-                <ResponsiveContainer width="100%" height={350}>
-                  <ComposedChart data={syntheticChartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                    <XAxis
-                      dataKey="time"
-                      tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                      axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                      interval="preserveStartEnd"
-                    />
-                    <YAxis
-                      tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                      axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                      width={70}
-                      domain={["auto", "auto"]}
-                    />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: "rgba(15,23,42,0.95)",
-                        border: "1px solid rgba(6,182,212,0.3)",
-                        borderRadius: "6px",
-                        fontSize: "10px",
-                      }}
-                    />
-                    <ReferenceLine y={syntheticData.stats.mean} stroke="rgba(255,255,255,0.2)" strokeDasharray="3 3" />
-                    {showBB && (
-                      <>
-                        <Line
-                          type="monotone"
-                          dataKey="bbUpper"
-                          stroke="rgba(239,68,68,0.3)"
-                          strokeWidth={1}
-                          strokeDasharray="3 3"
-                          dot={false}
-                          name="BB Upper"
-                          connectNulls={false}
-                        />
-                        <Line
-                          type="monotone"
-                          dataKey="bbLower"
-                          stroke="rgba(239,68,68,0.3)"
-                          strokeWidth={1}
-                          strokeDasharray="3 3"
-                          dot={false}
-                          name="BB Lower"
-                          connectNulls={false}
-                        />
-                      </>
-                    )}
-                    <Line
-                      type="monotone"
-                      dataKey="close"
-                      stroke="#06b6d4"
-                      strokeWidth={1.5}
-                      dot={false}
-                      name="Close"
-                    />
-                  </ComposedChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
-
-            {/* Z-Score for synthetic */}
-            {showZScore && (
-              <Card className="bg-card/80 border-border/50">
-                <CardHeader className="pb-1">
-                  <CardTitle className="text-xs font-medium text-muted-foreground">Z-Score</CardTitle>
-                </CardHeader>
-                <CardContent className="pt-0 p-2">
-                  <ResponsiveContainer width="100%" height={140}>
-                    <LineChart data={syntheticChartData}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" />
-                      <XAxis
-                        dataKey="time"
-                        tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                        axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                        interval="preserveStartEnd"
-                      />
-                      <YAxis
-                        tick={{ fontSize: 9, fill: "rgba(255,255,255,0.3)" }}
-                        axisLine={{ stroke: "rgba(255,255,255,0.1)" }}
-                        width={40}
-                      />
-                      <ReferenceLine y={0} stroke="rgba(255,255,255,0.15)" strokeDasharray="3 3" />
-                      <ReferenceLine y={2} stroke="rgba(239,68,68,0.3)" strokeDasharray="3 3" />
-                      <ReferenceLine y={-2} stroke="rgba(239,68,68,0.3)" strokeDasharray="3 3" />
-                      <Line
-                        type="monotone"
-                        dataKey="zScore"
-                        stroke="#a78bfa"
-                        strokeWidth={1.5}
-                        dot={false}
-                        name="Z-Score"
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </CardContent>
-              </Card>
-            )}
-
-            {/* Volume chart */}
-            <Card className="bg-card/80 border-border/50">
-              <CardHeader className="pb-1">
-                <CardTitle className="text-xs font-medium text-muted-foreground">Volume</CardTitle>
-              </CardHeader>
-              <CardContent className="pt-0 p-2">
-                <ResponsiveContainer width="100%" height={80}>
-                  <BarChart data={syntheticChartData}>
-                    <XAxis
-                      dataKey="time"
-                      tick={{ fontSize: 8, fill: "rgba(255,255,255,0.2)" }}
-                      axisLine={{ stroke: "rgba(255,255,255,0.05)" }}
-                      interval="preserveStartEnd"
-                    />
-                    <YAxis hide />
-                    <Bar dataKey="volume" fill="rgba(6,182,212,0.3)" name="Volume" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </CardContent>
-            </Card>
-
-            {/* Stats */}
-            <Card className="bg-card/80 border-border/50">
-              <CardContent className="p-3">
-                <div className="grid grid-cols-5 gap-3">
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Last Price</div>
-                    <div className="text-sm font-mono font-bold text-foreground">
-                      {syntheticData.stats.lastPrice.toFixed(2)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Z-Score</div>
-                    <div
-                      className={`text-sm font-mono font-bold ${
-                        Math.abs(syntheticData.stats.lastZScore) > 2
-                          ? "text-yellow-400"
-                          : "text-foreground"
-                      }`}
-                    >
-                      {syntheticData.stats.lastZScore.toFixed(3)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Mean</div>
-                    <div className="text-sm font-mono text-foreground">
-                      {syntheticData.stats.mean.toFixed(2)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">Std Dev</div>
-                    <div className="text-sm font-mono text-foreground">
-                      {syntheticData.stats.stdDev.toFixed(2)}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] text-muted-foreground">% Dev</div>
-                    <div
-                      className={`text-sm font-mono font-bold ${
-                        Math.abs(syntheticData.stats.percentDeviation) > 5
-                          ? "text-yellow-400"
-                          : "text-foreground"
-                      }`}
-                    >
-                      {syntheticData.stats.percentDeviation.toFixed(2)}%
-                    </div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </>
+            {/* Chart */}
+            <div className="flex-1 min-h-0 rounded-lg overflow-hidden border border-border/30 bg-[#0a0e17]">
+              <SyntheticChart
+                data={syntheticData}
+                showZScore={showZScore}
+                showBB={showBB}
+              />
+            </div>
+          </div>
         ) : (
           <Card className="bg-card/80 border-border/50 flex-1">
             <CardContent className="flex items-center justify-center h-full">
               <div className="text-center">
                 <CandlestickChart className="h-12 w-12 text-muted-foreground/30 mx-auto mb-3" />
                 <div className="text-muted-foreground text-sm">
-                  {chartMode === "synthetic"
+                  {effectiveMode === "synthetic"
                     ? "Select a synthetic instrument to view its chart"
                     : "Enter a pair to view spread analysis"}
                 </div>
